@@ -48,3 +48,48 @@ Scenario: reservation has been written to DB, bank call is in progress, PostgreS
 | **5.7 Statement cursor stability** | Already implemented. Hard part is the snapshot guarantee: new entries written during pagination must not appear mid-walk. The `(created_at DESC, entry_id DESC)` cursor gives a consistent cut-point |
 | **S7.1, S7.2** (statement e2e tests) | Write entries in a background loop; walk pages in another thread; assert no duplicates and chain integrity | No additional architectural complexity |
 | **S4.2** (p95 < 300 ms during payouts) | Separate connection pools / executor for payout workers; transfer path must not wait on payout locks. Achieved by the two-phase design: transfers lock wallet rows, payouts lock payout rows – they don't compete for the same rows |
+
+
+
+
+---
+
+## Overall System Architecture & Design
+
+### What this system does
+This service is the core ledger and wallet engine behind M-PESA. It has two primary responsibilities:
+1. Move money between customer wallets (P2P transfers).
+2. Pay out funds to an external bank, handle slow or dropped bank responses, and process asynchronous bank webhooks safely.
+
+It runs across **two instances** against one shared **PostgreSQL** database, ensuring that no race condition, crash, or duplicate request can ever duplicate money or allow a negative balance.
+
+---
+
+### Core Principles & Real-World Examples
+
+#### 1. Deadlock-Free Concurrent Transfers
+* **The challenge:** Alice (`W001`) sends 500 santim to Bob (`W002`), while at the exact same millisecond Bob sends 200 santim to Alice from another instance. Without ordering, Instance A locks Alice and waits for Bob, while Instance B locks Bob and waits for Alice — deadlocking the database.
+* **Our solution:** Strict **lexicographical row-locking**. Every transfer sorts wallet IDs alphabetically before acquiring locks (`MIN(from, to)` then `MAX(from, to)` via `SELECT FOR UPDATE`). Both instances are forced to acquire locks in the exact same sequence (`W001` then `W002`), eliminating deadlocks completely. Database check constraints (`balance >= 0`) physically prevent overdrafts.
+
+#### 2. Two-Phase Bank Payouts
+* **The challenge:** Alice withdraws 1,000 santim to her bank account. The external bank is slow (taking 6–10 seconds, or timing out). Holding HTTP request threads and DB connections open while waiting for the bank would exhaust server capacity.
+* **Our solution:**
+  1. **Phase 1 (Instant Reservation):** Within < 100 ms, Alice's `reserved` balance is incremented by 1,000 santim and `202 ACCEPTED` is returned. Alice’s spendable balance (`balance - reserved`) drops immediately so she cannot double-spend that money.
+  2. **Phase 2 (Async Dispatch):** The HTTP call to the bank is dispatched on a dedicated background thread pool (`payoutExecutor`). When the bank sends a webhook callback:
+     - If `SUCCEEDED`: finalize payout, deduct balance, and release reservation.
+     - If `FAILED`: release reservation so Alice gets her 1,000 santim back immediately.
+
+#### 3. Out-of-Order Callbacks & Crash Recovery
+* **The challenge:** The bank's callback webhook might arrive twice, out-of-order, or the server might crash before the bank finishes.
+* **Our solution:**
+  - **Pessimistic callback lock:** The callback endpoint locks the payout row using `SELECT ... FOR UPDATE`. If the payout is already in a terminal state (`SUCCEEDED` or `FAILED`), duplicate callbacks are ignored safely.
+  - **Auto-Recovery Scheduler:** A background task runs every 30 seconds (`@Scheduled`) to find stuck `PENDING` payouts and polls the bank (`GET /bank/payouts/{id}`) for status, guaranteeing eventual consistency.
+
+#### 4. Safe Idempotency on Retries
+* **The challenge:** A client sends a transfer, but network drops right as the server finishes. The client retries with the same request.
+* **Our solution:** Every mutation requires an `Idempotency-Key` stored in PostgreSQL with `INSERT ... ON CONFLICT`:
+  - If another request with the same key is still running: returns `409 REQUEST_IN_PROGRESS`.
+  - Once completed: the final response status and JSON body are cached. When the client retries, the cached response is replayed without moving money twice.
+
+#### 5. Immutable Double-Entry Ledger
+Wallets store current balance snapshots. Every debit or credit appends an immutable record to `ledger_entries` with a running `balance_after`. This provides an auditable, tampering-proof transaction log.
