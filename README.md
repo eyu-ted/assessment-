@@ -1,3 +1,1 @@
-# Assessment
-
-Welcome to the assessment repository.
+# Wallet Service

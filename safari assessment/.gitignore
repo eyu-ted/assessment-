@@ -1,0 +1,27 @@
+# Maven build target
+target/
+!.mvn/wrapper/maven-wrapper.jar
+
+# IDE files
+.idea/
+*.iws
+*.iml
+*.ipr
+out/
+.classpath
+.project
+.settings/
+.factorypath
+
+# Antigravity / VS Code (keep shared settings)
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
+!.vscode/launch.json
+*.code-workspace
+
+# OS and logs
+Thumbs.db
+Desktop.ini
+.DS_Store
+*.log
