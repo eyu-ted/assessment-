@@ -1,0 +1,14 @@
+spring:
+  flyway:
+    locations: classpath:db/migration
+  jpa:
+    hibernate:
+      ddl-auto: validate
+
+# Tests use Testcontainers; these are overridden by @DynamicPropertySource
+bank:
+  base-url: http://localhost:9090
+  timeout-seconds: 2
+
+server:
+  port: 0   # random port for tests
