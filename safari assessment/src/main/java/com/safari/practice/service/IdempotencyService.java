@@ -1,49 +1,42 @@
 package com.safari.practice.service;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
-import com.safari.practice.domain.IdempotencyKey;
 import com.safari.practice.exception.WalletException;
-import com.safari.practice.repository.IdempotencyKeyRepository;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.dao.DataIntegrityViolationException;
-import org.springframework.http.HttpStatus;
+import org.springframework.dao.EmptyResultDataAccessException;
 import org.springframework.http.ResponseEntity;
+import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Service;
-import org.springframework.transaction.annotation.Propagation;
-import org.springframework.transaction.annotation.Transactional;
 
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.util.HexFormat;
-import java.util.Optional;
+import java.util.Map;
 import java.util.function.Supplier;
 
 /**
  * Database-backed idempotency layer (safe across two instances).
  *
  * Strategy:
- *  1. Try INSERT the key with status=IN_PROGRESS in its own transaction.
- *  2. If INSERT succeeds   → we own this request; execute the supplier.
- *  3. If INSERT fails (PK) → key already exists; read it:
- *       a. DONE            → replay cached response
- *       b. IN_PROGRESS     → 409 REQUEST_IN_PROGRESS
- *       c. Body hash diff  → 409 IDEMPOTENCY_CONFLICT
+ *  1. INSERT INTO idempotency_keys ... ON CONFLICT (idem_key) DO NOTHING.
+ *  2. If 1 row affected:
+ *       Caller owns this request and proceeds to execute action.
+ *       On completion, UPDATE status to DONE and save response.
+ *  3. If 0 rows affected:
+ *       Key already claimed. Query row:
+ *       - IN_PROGRESS -> 409 REQUEST_IN_PROGRESS
+ *       - Hash mismatch -> 409 IDEMPOTENCY_CONFLICT
+ *       - DONE -> Replay cached response
  */
 @Slf4j
 @Service
 @RequiredArgsConstructor
 public class IdempotencyService {
 
-    private final IdempotencyKeyRepository repo;
-    private final ObjectMapper             mapper;
+    private final JdbcTemplate jdbcTemplate;
+    private final ObjectMapper mapper;
 
-    /**
-     * @param key      the Idempotency-Key header value
-     * @param endpoint short endpoint name for logging
-     * @param body     raw request body (used for hash)
-     * @param action   the supplier that executes and returns the ResponseEntity
-     */
     public ResponseEntity<Object> execute(
             String key,
             String endpoint,
@@ -52,83 +45,77 @@ public class IdempotencyService {
 
         String hash = sha256(toJson(body));
 
-        // Step 1: try to claim the key
-        Optional<IdempotencyKey> existing = tryInsert(key, endpoint, hash);
+        // Atomic insert: returns 1 if this request claimed the key, 0 if conflict
+        int inserted = jdbcTemplate.update(
+                "INSERT INTO idempotency_keys (idem_key, endpoint, body_hash, status, created_at, expires_at) " +
+                "VALUES (?, ?, ?, 'IN_PROGRESS', NOW(), NOW() + INTERVAL '24 hours') " +
+                "ON CONFLICT (idem_key) DO NOTHING",
+                key, endpoint, hash
+        );
 
-        if (existing.isEmpty()) {
-            // We own the request – execute
-            return executeAndStore(key, hash, action);
+        if (inserted == 1) {
+            return executeAndStore(key, action);
         }
 
-        IdempotencyKey record = existing.get();
-
-        // Body mismatch → 409 IDEMPOTENCY_CONFLICT
-        if (!record.getBodyHash().equals(hash)) {
-            throw WalletException.idempotencyConflict(key);
-        }
-
-        // Still in progress → 409 REQUEST_IN_PROGRESS
-        if ("IN_PROGRESS".equals(record.getStatus())) {
+        // Another request claimed this key
+        Map<String, Object> row;
+        try {
+            row = jdbcTemplate.queryForMap(
+                    "SELECT status, body_hash, response_status, response_body FROM idempotency_keys WHERE idem_key = ?",
+                    key
+            );
+        } catch (EmptyResultDataAccessException e) {
+            // Very rare race if key expired/deleted: treat as in progress
             throw WalletException.requestInProgress(key);
         }
 
-        // Done → replay
-        return replay(record);
-    }
-
-    @Transactional(propagation = Propagation.REQUIRES_NEW)
-    public Optional<IdempotencyKey> tryInsert(String key, String endpoint, String hash) {
-        try {
-            IdempotencyKey ik = new IdempotencyKey();
-            ik.setIdemKey(key);
-            ik.setEndpoint(endpoint);
-            ik.setBodyHash(hash);
-            ik.setStatus("IN_PROGRESS");
-            repo.saveAndFlush(ik);
-            return Optional.empty(); // we inserted, we own it
-        } catch (DataIntegrityViolationException e) {
-            return repo.findById(key); // someone else owns it
+        String existingHash = (String) row.get("body_hash");
+        if (existingHash != null && !existingHash.equals(hash)) {
+            throw WalletException.idempotencyConflict(key);
         }
+
+        String status = (String) row.get("status");
+        if ("IN_PROGRESS".equals(status)) {
+            throw WalletException.requestInProgress(key);
+        }
+
+        // DONE: Replay cached response
+        int respStatus = ((Number) row.get("response_status")).intValue();
+        String respBody = (String) row.get("response_body");
+        return replay(respStatus, respBody);
     }
 
     private ResponseEntity<Object> executeAndStore(
-            String key, String bodyHash, Supplier<ResponseEntity<Object>> action) {
+            String key, Supplier<ResponseEntity<Object>> action) {
         try {
             ResponseEntity<Object> result = action.get();
             markDone(key, result.getStatusCode().value(), toJson(result.getBody()));
             return result;
         } catch (WalletException ex) {
-            // Business errors are also cached so replays return the same code
             markDone(key, ex.getHttpStatus().value(),
                     toJson(new ErrorBody(ex.getErrorCode(), ex.getMessage())));
             throw ex;
         } catch (Exception ex) {
-            // Unexpected – don't cache; delete the key so client can retry
             deleteKey(key);
             throw ex;
         }
     }
 
-    @Transactional(propagation = Propagation.REQUIRES_NEW)
-    public void markDone(String key, int status, String body) {
-        repo.findById(key).ifPresent(ik -> {
-            ik.setStatus("DONE");
-            ik.setResponseStatus(status);
-            ik.setResponseBody(body);
-            repo.save(ik);
-        });
+    private void markDone(String key, int status, String body) {
+        jdbcTemplate.update(
+                "UPDATE idempotency_keys SET status = 'DONE', response_status = ?, response_body = ? WHERE idem_key = ?",
+                status, body, key
+        );
     }
 
-    @Transactional(propagation = Propagation.REQUIRES_NEW)
-    public void deleteKey(String key) {
-        repo.deleteById(key);
+    private void deleteKey(String key) {
+        jdbcTemplate.update("DELETE FROM idempotency_keys WHERE idem_key = ?", key);
     }
 
-    @SuppressWarnings("unchecked")
-    private ResponseEntity<Object> replay(IdempotencyKey record) {
+    private ResponseEntity<Object> replay(int status, String bodyJson) {
         try {
-            Object body = mapper.readValue(record.getResponseBody(), Object.class);
-            return ResponseEntity.status(record.getResponseStatus()).body(body);
+            Object body = mapper.readValue(bodyJson, Object.class);
+            return ResponseEntity.status(status).body(body);
         } catch (Exception e) {
             log.error("Failed to deserialise cached idempotency body", e);
             throw WalletException.serviceUnavailable();
