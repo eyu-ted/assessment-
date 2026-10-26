@@ -1,0 +1,40 @@
+spring:
+  application:
+    name: mpesa-wallet
+
+  datasource:
+    url: ${DB_URL:jdbc:postgresql://localhost:5432/mpesa}
+    username: ${DB_USER:postgres}
+    password: ${DB_PASS:postgres}
+    hikari:
+      maximum-pool-size: 10
+      connection-timeout: 2000
+      pool-name: WalletPool
+
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    properties:
+      hibernate:
+        dialect: org.hibernate.dialect.PostgreSQLDialect
+        format_sql: false
+    open-in-view: false
+
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+
+server:
+  port: ${SERVER_PORT:8081}
+  tomcat:
+    threads:
+      max: 50
+
+# Fake bank
+bank:
+  base-url: ${BANK_URL:http://localhost:9090}
+  timeout-seconds: 8
+
+# Payout recovery scheduler
+payout:
+  recovery-interval-ms: 30000
