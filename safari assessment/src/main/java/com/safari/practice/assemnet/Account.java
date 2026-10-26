@@ -28,7 +28,7 @@ public class Account {
     public String getId(){
         return this.id;
     }
-    public BigDecimal getBigDecimal(){
+    public BigDecimal getbalance(){
         return this.balance;
     }
 
