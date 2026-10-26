@@ -1,7 +1,9 @@
 package com.safari.practice.assemnet;
 
 import java.math.BigDecimal;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.*;
 
 public class Service {
 
@@ -9,12 +11,14 @@ public class Service {
 
     AtomicInteger i = new AtomicInteger(0);
 
+    Map<String,Boolean> idepontency_dictionary = new ConcurrentHashMap<>();
+
     public Service(repo rep){
 
         this.repo= rep;
     }
 
-    public String create(BigDecimal inital_funding){
+    public String create_account(BigDecimal inital_funding){
 
         if (inital_funding.compareTo(BigDecimal.ZERO)<0){
             throw new IllegalArgumentException("inial funding cannot lessthan Zero");
@@ -30,7 +34,11 @@ public class Service {
     }
 
 
-    public void transfer(String from, String to, BigDecimal amount){
+    public void transfer(String from, String to, BigDecimal amount,String key){
+
+        if(idepontency_dictionary.containsKey(key)){
+            throw new IllegalArgumentException("this transaction has already been excuted try later.");
+        }
 
         Account first;
         Account second;
@@ -60,6 +68,7 @@ public class Service {
 
                 first.withdrawl(amount);
                 second.deposit(amount);
+                this.idepontency_dictionary.putIfAbsent(to, true);
 
             }finally{
                 second.unlock();
